@@ -11,6 +11,7 @@
 # Test binaries
 tests/test_routing
 tests/test_error_paths
+tests/test_rails
 # Debug files
 core
 *.core

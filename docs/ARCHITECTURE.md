@@ -476,6 +476,51 @@ Common issues:
 3. **"QP transition failed"**: GID index wrong, try different `NCCL_MESH_GID_INDEX`
 4. **"WC error status=12"**: Transport retry exceeded, check RDMA connectivity
 
+### Multi-rail device selection
+
+The plugin groups RDMA devices by PCI bus/device while ignoring the final PCI
+function. For a multi-function ConnectX adapter, ports `.0` and `.1` on the
+same PCIe endpoint therefore form one NCCL-visible rail. A system with the
+following devices exposes two Mesh devices, not four:
+
+```text
+MeshRail0: rocep1s0f0, rocep1s0f1
+MeshRail1: roceP2p1s0f0, roceP2p1s0f1
+```
+
+
+Rail construction is selectable with `NCCL_MESH_RAIL_GROUPING`. The default
+`pcie` mode groups both port functions below each PCIe endpoint. The `cable`
+mode groups matching trailing `fN` device-name suffixes across PCIe endpoints,
+falling back to the final PCI function number. Cable mode models each matching
+physical-port group as one NCCL-visible device; a connection still selects one
+reachable member and does not aggregate QPs within that rail. All ranks must
+use the same mode.
+
+Each `listen()` handle advertises its requested rail first, followed by the
+other addresses needed for partial-mesh fallback. `connect()` selects the rail
+from NCCL's device index and the physical port from the subnet shared with the
+peer. Separate NCCL channels can consequently use separate PCIe rails while
+each rail can reach either neighbor of a ring through a different port.
+
+`NCCL_MESH_HCA` filters the RDMA devices exposed by the plugin. If it is not
+set, the plugin accepts `NCCL_IB_HCA` for compatibility with standard NCCL
+launch commands. The supported syntax is comma-separated device names or
+prefixes, optional exact matching with `=`, exclusion with `^`, and optional
+port suffixes. A four-node ring in which both ports of both rails are required
+should leave the filter unset or include all four RDMA device names. Filtering
+to only the `f0` devices makes the `f1` ring links unreachable.
+
+### Current topology-discovery limitation
+
+The current handshake exchanges addresses and QP information, but it does not
+exchange `mesh_node_identity` records or propagate the global adjacency graph.
+Consequently, direct subnet-aware connections work, while the routing layer
+does not yet independently discover a complete multi-node ring or activate
+relay paths for non-neighbor pairs. Until global discovery is wired into the
+protocol, NCCL ranks must be ordered along the physical ring and collectives
+must use direct-neighbor ring edges.
+
 ## Conclusion
 
 The NCCL Mesh Plugin demonstrates that with careful engineering, NCCL can be extended to support unconventional network topologies. The key innovations—multi-address handles, subnet-aware NIC selection, and asynchronous handshaking—provide a template for other custom NCCL transports.

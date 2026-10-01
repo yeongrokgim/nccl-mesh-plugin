@@ -15,6 +15,7 @@
 #include <infiniband/verbs.h>
 
 #define MESH_MAX_NICS 8
+#define MESH_MAX_RAILS MESH_MAX_NICS
 #define MESH_MAX_QPS 256
 #define MESH_MAX_MRS 1024
 #define MESH_HANDLE_MAGIC 0x4D455348  // "MESH"
@@ -86,6 +87,24 @@ struct mesh_nic {
                                 // 0=unknown, 1=management (10GbE), 2=fast (100Gbps+)
 };
 
+enum mesh_rail_grouping {
+    MESH_RAIL_GROUP_PCIE = 0,
+    MESH_RAIL_GROUP_CABLE = 1,
+};
+
+/*
+ * One NCCL-visible device. Depending on NCCL_MESH_RAIL_GROUPING, a rail
+ * contains either the ports on one PCIe endpoint or matching physical-port
+ * functions across PCIe endpoints. Subnet matching chooses a reachable NIC.
+ */
+struct mesh_rail {
+    int nic_indices[MESH_MAX_NICS];
+    int num_nics;
+    char name[64];
+    char pci_path[256];
+    char key[256];
+};
+
 /*
  * Address entry for multi-homed hosts
  */
@@ -106,7 +125,9 @@ struct mesh_addr_entry {
 struct mesh_handle {
     uint32_t magic;             // MESH_HANDLE_MAGIC
     uint8_t  num_addrs;         // Number of valid addresses
-    uint8_t  selected_idx;      // Which address was selected (set by connect)
+    uint8_t  selected_idx;      // First address in the preferred NCCL rail
+    uint8_t  selected_count;    // Number of contiguous preferred-rail addresses
+    uint8_t  reserved0;
     uint16_t lid;               // IB LID (0 for RoCE)
     uint16_t qp_num;            // QP number (for compat with mesh_connect_qp)
     uint16_t handshake_port;    // TCP port for QP handshake
@@ -116,7 +137,7 @@ struct mesh_handle {
     uint32_t handshake_ip;      // IP address for handshake (network byte order)
     union ibv_gid gid;          // GID (16 bytes)
     struct mesh_addr_entry addrs[MESH_MAX_ADDRS];  // 12 bytes each
-    // Total: 4+1+1+2+2+2+1+1+4+4+16 + 6*12 = 38 + 72 = 110 bytes (fits in 128)
+    // The structure (including padding) must remain within the 128-byte NCCL handle.
 };
 
 /*
@@ -384,6 +405,8 @@ struct mesh_request {
 struct mesh_plugin_state {
     struct mesh_nic nics[MESH_MAX_NICS];
     int num_nics;
+    struct mesh_rail rails[MESH_MAX_RAILS];
+    int num_rails;
     int initialized;
 
     // Configuration from environment variables
@@ -393,6 +416,7 @@ struct mesh_plugin_state {
     int timeout_ms;             // NCCL_MESH_TIMEOUT_MS: connection timeout in ms (default: 5000)
     int retry_count;            // NCCL_MESH_RETRY_COUNT: retry attempts (default: 3)
     int disable_rdma;           // NCCL_MESH_DISABLE_RDMA: force TCP fallback
+    int rail_grouping;          // NCCL_MESH_RAIL_GROUPING: pcie (default) or cable
 
     // Connection pooling config (TICKET-6)
     int enable_conn_pool;       // NCCL_MESH_CONN_POOL: enable connection pooling (default: 1)
@@ -525,7 +549,7 @@ const char* mesh_find_netdev_for_rdma(const char *rdma_dev);
 #define MESH_LOG(level, fmt, ...) \
     do { \
         if (g_mesh_state.log_fn) { \
-            g_mesh_state.log_fn(level, 0, __FILE__, __LINE__, fmt, ##__VA_ARGS__); \
+            g_mesh_state.log_fn(level, 0x10 /* NCCL_NET */, __FILE__, __LINE__, fmt, ##__VA_ARGS__); \
         } \
     } while(0)
 

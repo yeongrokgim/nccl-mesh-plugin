@@ -33,7 +33,7 @@ $(TARGET): $(OBJS)
 $(TARGET_MESH): $(TARGET)
 	ln -sf $(TARGET) $(TARGET_MESH)
 
-%.o: %.c
+%.o: %.c include/mesh_plugin.h include/mesh_routing.h nccl/net.h nccl/net_v8.h nccl/net_v9.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Install to a standard location
@@ -45,7 +45,7 @@ install: all
 
 # Clean
 clean:
-	rm -f $(OBJS) $(TARGET) $(TARGET_MESH) tests/test_routing tests/test_error_paths
+	rm -f $(OBJS) $(TARGET) $(TARGET_MESH) tests/test_routing tests/test_error_paths tests/test_rails
 
 # Test build (requires libibverbs-dev)
 test-deps:
@@ -71,7 +71,7 @@ info:
 
 # Test flags (no -fPIC, add pthread)
 TEST_CFLAGS = -Wall -Wextra -O2 -g -I. -iquote ./include $(IBVERBS_CFLAGS)
-TEST_LDFLAGS = -lpthread
+TEST_LDFLAGS = -lpthread $(IBVERBS_LIBS)
 
 # Unit test for routing
 test_routing: tests/test_routing.c src/mesh_routing.c
@@ -82,20 +82,22 @@ test_error_paths: tests/test_error_paths.c
 	$(CC) $(TEST_CFLAGS) $^ -o tests/$@ $(TEST_LDFLAGS)
 
 # Run unit tests
-test: test_routing test_error_paths
+test: test_routing test_error_paths test_rails
 	@echo ""
 	@echo "Running unit tests..."
 	@./tests/test_routing
 	@./tests/test_error_paths
+	@./tests/test_rails
 	@echo ""
 	@echo "Running integration tests..."
 	@python3 tests/test_ring_topo.py
 	@python3 tests/test_line_topo.py
 
 # Run unit tests only (C)
-test-unit: test_routing test_error_paths
+test-unit: test_routing test_error_paths test_rails
 	@./tests/test_routing
 	@./tests/test_error_paths
+	@./tests/test_rails
 
 # Run integration tests only (Python)
 test-integration:
@@ -103,3 +105,9 @@ test-integration:
 	@python3 tests/test_line_topo.py -v
 
 .PHONY: all clean install test-deps debug info test test_routing test_error_paths test-unit test-integration
+
+# Exercise production rail grouping, properties and address selection without RDMA hardware.
+test_rails: tests/test_rails.c src/mesh_plugin.c src/mesh_routing.c include/mesh_plugin.h
+	$(CC) $(TEST_CFLAGS) tests/test_rails.c src/mesh_routing.c -o tests/$@ $(LDLIBS)
+
+.PHONY: test_rails

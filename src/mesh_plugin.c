@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -564,6 +565,258 @@ int mesh_get_gid(struct mesh_nic *nic, union ibv_gid *gid) {
 }
 
 /*
+ * Match an RDMA device name against NCCL's HCA-list syntax.
+ *
+ * NCCL does not apply NCCL_IB_HCA to devices returned by an external net
+ * plugin, so apply the useful subset here: comma-separated prefixes, an
+ * optional leading '^' exclusion list, an optional leading '=' exact-match
+ * modifier, and optional ':port' suffixes. NCCL_MESH_HCA takes precedence;
+ * NCCL_IB_HCA keeps existing launch commands compatible.
+ */
+static int mesh_hca_filter_allows(const char *filter, const char *dev_name) {
+    if (!filter || !filter[0] || !dev_name || !dev_name[0]) return 1;
+
+    while (*filter == ' ' || *filter == '\t') filter++;
+
+    int exclude = 0;
+    int exact_all = 0;
+    if (*filter == '^') {
+        exclude = 1;
+        filter++;
+    }
+    if (*filter == '=') {
+        exact_all = 1;
+        filter++;
+    }
+
+    char *copy = strdup(filter);
+    if (!copy) {
+        MESH_WARN("Could not allocate HCA filter buffer; keeping device %s", dev_name);
+        return 1;
+    }
+
+    int matched = 0;
+    int have_token = 0;
+    char *saveptr = NULL;
+    for (char *token = strtok_r(copy, ",", &saveptr);
+         token != NULL;
+         token = strtok_r(NULL, ",", &saveptr)) {
+        while (*token == ' ' || *token == '\t') token++;
+        char *end = token + strlen(token);
+        while (end > token && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+
+        int exact = exact_all;
+        if (*token == '=') {
+            exact = 1;
+            token++;
+        }
+
+        /* A port selector does not change which ibv_device is admitted. */
+        char *port = strchr(token, ':');
+        if (port) *port = '\0';
+        if (!token[0]) continue;
+
+        have_token = 1;
+        size_t token_len = strlen(token);
+        if ((exact && strcmp(dev_name, token) == 0) ||
+            (!exact && strncmp(dev_name, token, token_len) == 0)) {
+            matched = 1;
+            break;
+        }
+    }
+
+    free(copy);
+    if (!have_token) return 1;
+    return exclude ? !matched : matched;
+}
+
+static int mesh_nic_reaches_ip(const struct mesh_nic *nic, uint32_t peer_ip) {
+    return nic && nic->ip_addr != 0 && nic->netmask != 0 &&
+           (peer_ip & nic->netmask) == nic->subnet;
+}
+
+static const char *mesh_rail_grouping_name(int grouping) {
+    return grouping == MESH_RAIL_GROUP_CABLE ? "cable" : "pcie";
+}
+
+static int mesh_parse_rail_grouping(const char *value) {
+    if (!value || !value[0] || strcasecmp(value, "pcie") == 0) {
+        return MESH_RAIL_GROUP_PCIE;
+    }
+    if (strcasecmp(value, "cable") == 0) {
+        return MESH_RAIL_GROUP_CABLE;
+    }
+    return -1;
+}
+
+static int mesh_get_cable_port(const struct mesh_nic *nic) {
+    /* The target system names matching physical ports ...f0 and ...f1. */
+    const char *f = strrchr(nic->dev_name, 'f');
+    if (f && f[1]) {
+        char *end = NULL;
+        long port = strtol(f + 1, &end, 10);
+        if (end && *end == '\0' && port >= 0 && port <= INT_MAX) {
+            return (int)port;
+        }
+    }
+
+    /* Fall back to the PCI function from the final BDF component. */
+    const char *base = strrchr(nic->pci_path, '/');
+    base = base ? base + 1 : nic->pci_path;
+    const char *dot = strrchr(base, '.');
+    if (dot && dot[1]) {
+        char *end = NULL;
+        long function = strtol(dot + 1, &end, 16);
+        if (end && *end == '\0' && function >= 0 && function <= INT_MAX) {
+            return (int)function;
+        }
+    }
+    return -1;
+}
+
+static void mesh_get_rail_key(const struct mesh_nic *nic, int grouping,
+                              char *key, size_t key_len) {
+    if (grouping == MESH_RAIL_GROUP_CABLE) {
+        int port = mesh_get_cable_port(nic);
+        if (port >= 0) {
+            snprintf(key, key_len, "cable:port:%d", port);
+            return;
+        }
+        /* Do not accidentally combine unknown ports into one rail. */
+        snprintf(key, key_len, "cable:nic:%s", nic->dev_name);
+        return;
+    }
+
+    /* Remove the PCI function from the final BDF (....:dd.f -> ....:dd). */
+    if (!nic->pci_path[0]) {
+        snprintf(key, key_len, "nic:%s", nic->dev_name);
+        return;
+    }
+
+    strncpy(key, nic->pci_path, key_len - 1);
+    key[key_len - 1] = '\0';
+
+    char *base = strrchr(key, '/');
+    base = base ? base + 1 : key;
+    char *dot = strrchr(base, '.');
+    if (dot && strchr(base, ':')) {
+        *dot = '\0';
+    }
+}
+
+/*
+ * Build NCCL-visible rails using the selected grouping. PCIe mode groups
+ * functions .0/.1 below the same endpoint. Cable mode groups matching fN
+ * device suffixes (falling back to the PCI function number) across endpoints.
+ */
+static int mesh_build_rails(void) {
+    memset(g_mesh_state.rails, 0, sizeof(g_mesh_state.rails));
+    g_mesh_state.num_rails = 0;
+
+    for (int nic_idx = 0; nic_idx < g_mesh_state.num_nics; nic_idx++) {
+        struct mesh_nic *nic = &g_mesh_state.nics[nic_idx];
+        char key[256];
+        mesh_get_rail_key(nic, g_mesh_state.rail_grouping, key, sizeof(key));
+
+        int rail_idx = -1;
+        for (int r = 0; r < g_mesh_state.num_rails; r++) {
+            if (strcmp(g_mesh_state.rails[r].key, key) == 0) {
+                rail_idx = r;
+                break;
+            }
+        }
+
+        if (rail_idx < 0) {
+            if (g_mesh_state.num_rails >= MESH_MAX_RAILS) {
+                MESH_WARN("Too many %s rails; cannot place NIC %s",
+                          mesh_rail_grouping_name(g_mesh_state.rail_grouping),
+                          nic->dev_name);
+                return -1;
+            }
+            rail_idx = g_mesh_state.num_rails++;
+            struct mesh_rail *rail = &g_mesh_state.rails[rail_idx];
+            snprintf(rail->key, sizeof(rail->key), "%s", key);
+            strncpy(rail->pci_path, nic->pci_path, sizeof(rail->pci_path) - 1);
+            snprintf(rail->name, sizeof(rail->name), "MeshRail%d", rail_idx);
+        }
+
+        struct mesh_rail *rail = &g_mesh_state.rails[rail_idx];
+        if (rail->num_nics >= MESH_MAX_NICS) {
+            MESH_WARN("Too many NICs in rail %d", rail_idx);
+            return -1;
+        }
+        rail->nic_indices[rail->num_nics++] = nic_idx;
+        MESH_INFO("Assigned NIC %s (%s) to NCCL rail %d (%s)",
+                  nic->dev_name, nic->if_name, rail_idx, rail->key);
+    }
+
+    MESH_INFO("Grouped %d RDMA NICs into %d NCCL-visible %s rails",
+              g_mesh_state.num_nics, g_mesh_state.num_rails,
+              mesh_rail_grouping_name(g_mesh_state.rail_grouping));
+    return g_mesh_state.num_rails > 0 ? 0 : -1;
+}
+
+static int mesh_net_device_count(void) {
+    return g_mesh_state.tcp_fallback_active ? g_mesh_state.num_nics
+                                            : g_mesh_state.num_rails;
+}
+
+static int mesh_rail_contains_nic(const struct mesh_rail *rail, int nic_idx) {
+    for (int i = 0; rail && i < rail->num_nics; i++) {
+        if (rail->nic_indices[i] == nic_idx) return 1;
+    }
+    return 0;
+}
+
+/* Select within NCCL's requested rail before considering routing fallback. */
+static struct mesh_addr_entry *mesh_select_rail_address(
+        const struct mesh_rail *requested_rail, struct mesh_handle *handle,
+        struct mesh_nic **selected_nic) {
+    struct mesh_nic *nic = NULL;
+    struct mesh_addr_entry *selected_addr = NULL;
+    *selected_nic = NULL;
+    if (handle->num_addrs > MESH_MAX_ADDRS) return NULL;
+    int preferred_start = handle->selected_idx;
+    int preferred_end = preferred_start + handle->selected_count;
+    if (preferred_start < handle->num_addrs &&
+        preferred_end <= handle->num_addrs) {
+        for (int i = preferred_start; !selected_addr && i < preferred_end; i++) {
+            struct mesh_addr_entry *addr = &handle->addrs[i];
+            uint32_t peer_ip = ntohl(addr->ip);
+            for (int r = 0; r < requested_rail->num_nics; r++) {
+                struct mesh_nic *candidate =
+                    &g_mesh_state.nics[requested_rail->nic_indices[r]];
+                if (mesh_nic_reaches_ip(candidate, peer_ip)) {
+                    nic = candidate;
+                    selected_addr = addr;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!selected_addr) {
+        for (int i = 0; i < handle->num_addrs; i++) {
+            struct mesh_addr_entry *addr = &handle->addrs[i];
+            uint32_t peer_ip = ntohl(addr->ip);
+            for (int r = 0; r < requested_rail->num_nics; r++) {
+                struct mesh_nic *candidate =
+                    &g_mesh_state.nics[requested_rail->nic_indices[r]];
+                if (mesh_nic_reaches_ip(candidate, peer_ip)) {
+                    nic = candidate;
+                    selected_addr = addr;
+                    break;
+                }
+            }
+            if (selected_addr) break;
+        }
+    }
+
+    *selected_nic = nic;
+    return selected_addr;
+}
+
+/*
  * Initialize all NICs
  */
 int mesh_init_nics(void) {
@@ -582,10 +835,28 @@ int mesh_init_nics(void) {
         return -1;
     }
     
+    const char *hca_filter = getenv("NCCL_MESH_HCA");
+    const char *hca_filter_source = "NCCL_MESH_HCA";
+    if (!hca_filter || !hca_filter[0]) {
+        hca_filter = getenv("NCCL_IB_HCA");
+        hca_filter_source = "NCCL_IB_HCA";
+    }
+
     MESH_INFO("Found %d RDMA devices", num_devices);
+    if (hca_filter && hca_filter[0]) {
+        MESH_INFO("Applying %s=%s to Mesh device discovery",
+                  hca_filter_source, hca_filter);
+    }
     
     g_mesh_state.num_nics = 0;
     for (int i = 0; i < num_devices && g_mesh_state.num_nics < MESH_MAX_NICS; i++) {
+        const char *dev_name = ibv_get_device_name(dev_list[i]);
+        if (!mesh_hca_filter_allows(hca_filter, dev_name)) {
+            MESH_INFO("Skipping RDMA device %s due to %s",
+                      dev_name, hca_filter_source);
+            continue;
+        }
+
         struct mesh_nic *nic = &g_mesh_state.nics[g_mesh_state.num_nics];
         memset(nic, 0, sizeof(*nic));
         
@@ -2864,6 +3135,14 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     env_val = getenv("NCCL_MESH_DISABLE_RDMA");
     g_mesh_state.disable_rdma = env_val ? atoi(env_val) : 0;
 
+    // NCCL_MESH_RAIL_GROUPING: pcie (default) or cable
+    env_val = getenv("NCCL_MESH_RAIL_GROUPING");
+    g_mesh_state.rail_grouping = mesh_parse_rail_grouping(env_val);
+    if (g_mesh_state.rail_grouping < 0) {
+        MESH_WARN("Unknown NCCL_MESH_RAIL_GROUPING='%s'; using pcie", env_val);
+        g_mesh_state.rail_grouping = MESH_RAIL_GROUP_PCIE;
+    }
+
     // NCCL_MESH_CONN_POOL: Enable connection pooling (default: 1) (TICKET-6)
     env_val = getenv("NCCL_MESH_CONN_POOL");
     g_mesh_state.enable_conn_pool = env_val ? atoi(env_val) : 1;
@@ -2911,10 +3190,11 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
 
     // Log configuration (always shown at init, regardless of debug level)
     MESH_LOG(NCCL_LOG_INFO, "MESH Initializing: gid=%d debug=%d fast_fail=%d timeout=%dms retries=%d "
-             "disable_rdma=%d conn_pool=%d async_connect=%d",
+             "disable_rdma=%d conn_pool=%d async_connect=%d rail_grouping=%s",
              g_mesh_state.gid_index, g_mesh_state.debug_level, g_mesh_state.fast_fail,
              g_mesh_state.timeout_ms, g_mesh_state.retry_count, g_mesh_state.disable_rdma,
-             g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect);
+             g_mesh_state.enable_conn_pool, g_mesh_state.enable_async_connect,
+             mesh_rail_grouping_name(g_mesh_state.rail_grouping));
     MESH_LOG(NCCL_LOG_INFO, "MESH Error hardening: op_timeout=%ds connect_timeout=%ds "
              "accept_timeout=%ds health_check=%dms fatal_on_timeout=%d",
              g_mesh_state.op_timeout_sec, g_mesh_state.connect_timeout_sec,
@@ -2958,6 +3238,12 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
         return ncclSuccess;
     }
 
+    if (mesh_build_rails() != 0) {
+        MESH_WARN("Failed to group RDMA NICs into %s rails",
+                  mesh_rail_grouping_name(g_mesh_state.rail_grouping));
+        return ncclSystemError;
+    }
+
     // Initialize connection pool if enabled (TICKET-6)
     if (g_mesh_state.enable_conn_pool) {
         mesh_conn_pool_init();
@@ -2995,29 +3281,37 @@ static ncclResult_t mesh_init(ncclDebugLogger_t logFunction) {
     }
 
     g_mesh_state.initialized = 1;
-    MESH_INFO("Mesh plugin initialized with %d NICs (RDMA mode)", g_mesh_state.num_nics);
+    MESH_INFO("Mesh plugin initialized with %d NICs on %d %s rails (RDMA mode)",
+              g_mesh_state.num_nics, g_mesh_state.num_rails,
+              mesh_rail_grouping_name(g_mesh_state.rail_grouping));
 
     return ncclSuccess;
 }
 
 static ncclResult_t mesh_devices(int *ndev) {
-    *ndev = g_mesh_state.num_nics;
+    *ndev = mesh_net_device_count();
+    MESH_INFO("devices: Exposing %d Mesh network devices to NCCL", *ndev);
     return ncclSuccess;
 }
 
 static ncclResult_t mesh_getProperties(int dev, ncclNetProperties_v8_t *props) {
-    if (dev < 0 || dev >= g_mesh_state.num_nics) {
+    if (dev < 0 || dev >= mesh_net_device_count()) {
         return ncclInvalidArgument;
     }
-    
-    struct mesh_nic *nic = &g_mesh_state.nics[dev];
+
+    struct mesh_rail *rail = g_mesh_state.tcp_fallback_active ? NULL
+                                                              : &g_mesh_state.rails[dev];
+    int nic_idx = rail ? rail->nic_indices[0] : dev;
+    struct mesh_nic *nic = &g_mesh_state.nics[nic_idx];
     
     memset(props, 0, sizeof(*props));
-    props->name = nic->dev_name;
+    props->name = rail ? rail->name : nic->dev_name;
     /* TICKET-D: pciPath may be empty on Grace Blackwell (NVLink-C2C topology).
      * NCCL treats NULL/empty pciPath as "use any NIC" which is correct. */
-    props->pciPath = nic->pci_path[0] ? nic->pci_path : NULL;
-    props->guid = 0;
+    props->pciPath = rail ? (rail->pci_path[0] ? rail->pci_path : NULL)
+                          : (nic->pci_path[0] ? nic->pci_path : NULL);
+    /* Give each exposed rail a distinct NCCL topology identity. */
+    props->guid = (uint64_t)dev + 1;
     props->ptrSupport = NCCL_PTR_HOST;
     props->regIsGlobal = 0;
     // Use actual link speed if available, otherwise default to 100 Gbps
@@ -3039,7 +3333,20 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
         return mesh_tcp_listen_impl(dev, handle, listenComm);
     }
 
-    (void)dev;  // We listen on ALL NICs, not just the requested one
+    if (dev < 0 || dev >= g_mesh_state.num_rails) {
+        MESH_WARN("listen: Invalid rail index %d (num_rails=%d)",
+                  dev, g_mesh_state.num_rails);
+        return ncclInvalidArgument;
+    }
+
+    struct mesh_rail *requested_rail = &g_mesh_state.rails[dev];
+
+    /*
+     * Keep listening on every NIC: advertising all subnets is what lets a
+     * partial mesh find a reachable peer. selected_idx below records the
+     * NCCL-requested rail so connect() can prefer it instead of always taking
+     * the first reachable address.
+     */
 
     struct mesh_handle *h = (struct mesh_handle *)handle;
     struct mesh_listen_comm *comm;
@@ -3055,25 +3362,40 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     comm->psn = 0;
     comm->handshake_sock = -1;
     
-    // Create QP on EACH NIC
-    for (int i = 0; i < g_mesh_state.num_nics && i < MESH_MAX_NICS; i++) {
-        struct mesh_nic *nic = &g_mesh_state.nics[i];
-        struct ibv_qp *qp = NULL;
-        struct ibv_cq *cq = NULL;
-        
-        if (mesh_create_qp(nic, &qp, &cq) != 0) {
-            MESH_WARN("Failed to create QP on NIC %s, skipping", nic->dev_name);
-            continue;
+    /*
+     * Create QPs for the requested rail first, followed by all other NICs.
+     * The contiguous prefix is advertised as the preferred rail; the rest
+     * preserves subnet fallback for less symmetric partial-mesh layouts.
+     */
+    int preferred_qps = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < g_mesh_state.num_nics && comm->num_qps < MESH_MAX_NICS; i++) {
+            int in_requested_rail = mesh_rail_contains_nic(requested_rail, i);
+            if ((pass == 0 && !in_requested_rail) ||
+                (pass == 1 && in_requested_rail)) {
+                continue;
+            }
+
+            struct mesh_nic *nic = &g_mesh_state.nics[i];
+            struct ibv_qp *qp = NULL;
+            struct ibv_cq *cq = NULL;
+
+            if (mesh_create_qp(nic, &qp, &cq) != 0) {
+                MESH_WARN("Failed to create QP on NIC %s, skipping", nic->dev_name);
+                continue;
+            }
+
+            comm->qps[comm->num_qps].nic = nic;
+            comm->qps[comm->num_qps].qp = qp;
+            comm->qps[comm->num_qps].cq = cq;
+            comm->num_qps++;
+
+            char ip_str[INET_ADDRSTRLEN];
+            mesh_uint_to_ip(nic->ip_addr, ip_str, sizeof(ip_str));
+            MESH_INFO("listen: Created QP %d on rail %d NIC %s (IP=%s)",
+                      qp->qp_num, dev, nic->dev_name, ip_str);
         }
-        
-        comm->qps[comm->num_qps].nic = nic;
-        comm->qps[comm->num_qps].qp = qp;
-        comm->qps[comm->num_qps].cq = cq;
-        comm->num_qps++;
-        
-        char ip_str[INET_ADDRSTRLEN];
-        mesh_uint_to_ip(nic->ip_addr, ip_str, sizeof(ip_str));
-        MESH_INFO("listen: Created QP %d on %s (IP=%s)", qp->qp_num, nic->dev_name, ip_str);
+        if (pass == 0) preferred_qps = comm->num_qps;
     }
     
     if (comm->num_qps == 0) {
@@ -3111,6 +3433,9 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     memset(h, 0, sizeof(*h));
     h->magic = MESH_HANDLE_MAGIC;
     h->num_addrs = 0;
+    h->selected_idx = 0;
+    h->selected_count = preferred_qps < MESH_MAX_ADDRS
+                            ? preferred_qps : MESH_MAX_ADDRS;
     h->psn = comm->psn;
     h->port_num = 1;
     h->mtu = comm->qps[0].nic->active_mtu;  // Use NIC's actual MTU (TICKET-9)
@@ -3134,7 +3459,7 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
         entry->qp_num = comm->qps[i].qp->qp_num;
         entry->nic_idx = i;
         entry->gid_index = nic->gid_index;
-        
+
         char ip_str[INET_ADDRSTRLEN];
         mesh_uint_to_ip(nic->ip_addr, ip_str, sizeof(ip_str));
         MESH_INFO("listen: Advertising address %d: %s (QP %d)", 
@@ -3145,6 +3470,15 @@ static ncclResult_t mesh_listen(int dev, void *handle, void **listenComm) {
     
     MESH_INFO("listen: Ready with %d addresses on %d QPs, handshake port %d", 
               h->num_addrs, comm->num_qps, comm->handshake_port);
+    if (h->selected_count > 0) {
+        MESH_INFO("listen: NCCL rail %d (%s) prefers %u advertised addresses "
+                  "starting at %u",
+                  dev, requested_rail->name, (unsigned)h->selected_count,
+                  (unsigned)h->selected_idx);
+    } else {
+        MESH_WARN("listen: No QP was created for requested NCCL rail %d; "
+                  "connections will use subnet fallback", dev);
+    }
     
     *listenComm = comm;
     return ncclSuccess;
@@ -3162,7 +3496,13 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         return mesh_tcp_connect_impl(dev, opaqueHandle, sendComm, sendDevComm);
     }
 
-    (void)dev;  // We pick the right NIC based on subnet match
+    if (dev < 0 || dev >= g_mesh_state.num_rails) {
+        MESH_WARN("connect: Invalid rail index %d (num_rails=%d)",
+                  dev, g_mesh_state.num_rails);
+        return ncclInvalidArgument;
+    }
+
+    struct mesh_rail *requested_rail = &g_mesh_state.rails[dev];
 
     // NCCL-001: Check for fatal async event before connection attempt
     if (mesh_check_fatal_error()) {
@@ -3189,13 +3529,42 @@ static ncclResult_t mesh_connect(int dev, void *opaqueHandle, void **sendComm,
         return ncclInvalidArgument;
     }
     
-    MESH_INFO("connect: Peer advertised %d addresses", handle->num_addrs);
+    if (handle->num_addrs > MESH_MAX_ADDRS) {
+        MESH_WARN("connect: Peer advertised invalid address count %u (max=%d)",
+                  (unsigned)handle->num_addrs, MESH_MAX_ADDRS);
+        return ncclInvalidArgument;
+    }
+
+    MESH_INFO("connect: Peer advertised %d addresses (preferred=%u+%u), "
+              "NCCL requested rail %d (%s)",
+              handle->num_addrs, (unsigned)handle->selected_idx,
+              (unsigned)handle->selected_count, dev, requested_rail->name);
+
+    /*
+     * First honor NCCL's device assignment. This is essential for striping
+     * channels over independent PCIe/RDMA rails. Prefer the peer's requested
+     * rail when it is reachable, then any peer address reachable through the
+     * requested local rail. Only fall back to the original subnet-aware
+     * search when that rail cannot reach this peer (partial-mesh case).
+     */
+    selected_addr = mesh_select_rail_address(requested_rail, handle, &nic);
+
+    if (selected_addr) {
+        char ip_str[INET_ADDRSTRLEN];
+        mesh_uint_to_ip(ntohl(selected_addr->ip), ip_str, sizeof(ip_str));
+        MESH_INFO("connect: Honoring NCCL rail %d: local NIC %s -> peer address %s "
+                  "(peer NIC index %u)",
+                  dev, nic->dev_name, ip_str, (unsigned)selected_addr->nic_idx);
+    } else {
+        MESH_INFO("connect: NCCL rail %d (%s) has no subnet path to peer; "
+                  "using mesh routing fallback", dev, requested_rail->name);
+    }
 
     // Search through peer's addresses to find one we can reach
     // Priority: Fast lane (100Gbps+) first, then management (10GbE) as fallback
 
     // Pass 1: Try to find a fast lane connection
-    for (int i = 0; i < handle->num_addrs; i++) {
+    for (int i = 0; !nic && i < handle->num_addrs; i++) {
         struct mesh_addr_entry *addr = &handle->addrs[i];
         uint32_t peer_ip = ntohl(addr->ip);
 
@@ -4311,28 +4680,41 @@ static ncclResult_t mesh_irecvConsumed(void *recvComm, int n, void *request) {
     return ncclSuccess;
 }
 
-/* Static string storage for v9 properties (name and pciPath become pointers) */
-static char g_v9_name_storage[256];
-static char g_v9_pcipath_storage[256];
+/*
+ * v9 properties contain pointers. Keep separate stable storage per device;
+ * one shared buffer makes every previously returned property appear to have
+ * the name/path of the most recently queried NIC.
+ */
+static char g_v9_name_storage[MESH_MAX_NICS][64];
+static char g_v9_pcipath_storage[MESH_MAX_NICS][256];
 
 static ncclResult_t mesh_getProperties_v9(int dev, ncclNetProperties_v9_t *props) {
-    if (dev < 0 || dev >= g_mesh_state.num_nics) {
+    if (dev < 0 || dev >= mesh_net_device_count()) {
         return ncclInvalidArgument;
     }
 
-    struct mesh_nic *nic = &g_mesh_state.nics[dev];
+    struct mesh_rail *rail = g_mesh_state.tcp_fallback_active ? NULL
+                                                              : &g_mesh_state.rails[dev];
+    int nic_idx = rail ? rail->nic_indices[0] : dev;
+    struct mesh_nic *nic = &g_mesh_state.nics[nic_idx];
 
     memset(props, 0, sizeof(*props));
 
     /* v9 uses pointers for name and pciPath */
-    strncpy(g_v9_name_storage, nic->dev_name, sizeof(g_v9_name_storage) - 1);
-    strncpy(g_v9_pcipath_storage, nic->pci_path, sizeof(g_v9_pcipath_storage) - 1);
+    strncpy(g_v9_name_storage[dev], rail ? rail->name : nic->dev_name,
+            sizeof(g_v9_name_storage[dev]) - 1);
+    g_v9_name_storage[dev][sizeof(g_v9_name_storage[dev]) - 1] = '\0';
+    strncpy(g_v9_pcipath_storage[dev], rail ? rail->pci_path : nic->pci_path,
+            sizeof(g_v9_pcipath_storage[dev]) - 1);
+    g_v9_pcipath_storage[dev][sizeof(g_v9_pcipath_storage[dev]) - 1] = '\0';
 
-    props->name = g_v9_name_storage;
+    props->name = g_v9_name_storage[dev];
     /* TICKET-D: pciPath may be empty on Grace Blackwell (NVLink-C2C topology).
      * NCCL treats NULL pciPath as "use any NIC" which is correct. */
-    props->pciPath = g_v9_pcipath_storage[0] ? g_v9_pcipath_storage : NULL;
-    props->guid = 0;
+    props->pciPath = g_v9_pcipath_storage[dev][0] ? g_v9_pcipath_storage[dev] : NULL;
+    /* Each exposed rail has an independent PCIe bandwidth budget. NCCL
+     * groups equal (guid, port) pairs as shared network bandwidth. */
+    props->guid = (uint64_t)dev + 1;
     props->ptrSupport = NCCL_PTR_HOST;
     props->regIsGlobal = 0;
     props->forceFlush = 0;

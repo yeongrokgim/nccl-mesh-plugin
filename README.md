@@ -397,6 +397,7 @@ and fatal-error conditions to avoid indefinite silent hangs.
 | `NCCL_MESH_TIMEOUT_MS` | `5000` | Connection-operation timeout in milliseconds |
 | `NCCL_MESH_RETRY_COUNT` | `3` | Connection retry count |
 | `NCCL_MESH_DISABLE_RDMA` | `0` | Forces TCP fallback when set to 1 |
+| `NCCL_MESH_RAIL_GROUPING` | `pcie` | Groups rails by `pcie` endpoint or matching `cable`/`fN` port |
 | `NCCL_MESH_CONN_POOL` | `1` | Enables connection pooling |
 | `NCCL_MESH_ASYNC_CONNECT` | `1` | Enables asynchronous connection setup |
 | `NCCL_MESH_TIMEOUT_SEC` | `30` | Per-operation completion timeout |
